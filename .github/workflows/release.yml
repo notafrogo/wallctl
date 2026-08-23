@@ -46,9 +46,8 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           package="wallctl-${version}-${ARCH}"
-          mkdir -p "dist/${package}"
-          cp "target/${TARGET}/release/wallctl" "dist/${package}/wallctl"
-          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          mkdir -p dist
+          tar -C "target/${TARGET}/release" -czf "dist/${package}.tar.gz" wallctl
           shasum -a 256 "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
 
       - name: Upload packaged artifacts
