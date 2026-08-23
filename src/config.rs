@@ -1,16 +1,35 @@
+use anyhow::{bail, Context, Result};
 use ini::Ini;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const DEFAULT_INTERVAL_SECS: u64 = 300;
+
 #[derive(Debug, Clone)]
 pub struct Profile {
-    #[allow(dead_code)]
-    pub name: String,
     pub folder: PathBuf,
     pub interval: u64,
-    pub order: String,
+    pub order: PlaylistOrder,
     pub mute_video: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistOrder {
+    Random,
+    Alphabetical,
+}
+
+impl PlaylistOrder {
+    fn parse(value: &str, profile: &str) -> Result<Self> {
+        match value {
+            "random" => Ok(Self::Random),
+            "alphabetical" => Ok(Self::Alphabetical),
+            other => {
+                bail!("profile '{profile}' has invalid order '{other}'; use random or alphabetical")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -21,106 +40,115 @@ pub struct Config {
 }
 
 pub fn get_config_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("wallctl")
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".config").join("wallctl")
-    } else {
-        PathBuf::from(".config").join("wallctl")
-    }
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("wallctl")
 }
 
 pub fn get_config_file() -> PathBuf {
     get_config_dir().join("config.ini")
 }
-
-fn generate_black_image(path: &Path) {
-    let width: u32 = 1920;
-    let height: u32 = 1080;
-    let row_size = (width * 3 + 3) & !3;
-    let image_size = row_size * height;
-    let file_size = 54 + image_size;
-
-    let mut bmp = Vec::with_capacity(file_size as usize);
-    // BMP Header (14 bytes)
-    bmp.extend_from_slice(b"BM");
-    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&[0, 0, 0, 0]);
-    bmp.extend_from_slice(&54u32.to_le_bytes());
-
-    // DIB Header (40 bytes)
-    bmp.extend_from_slice(&40u32.to_le_bytes());
-    bmp.extend_from_slice(&(width as i32).to_le_bytes());
-    bmp.extend_from_slice(&(height as i32).to_le_bytes());
-    bmp.extend_from_slice(&1u16.to_le_bytes());
-    bmp.extend_from_slice(&24u16.to_le_bytes());
-    bmp.extend_from_slice(&0u32.to_le_bytes());
-    bmp.extend_from_slice(&(image_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&2835u32.to_le_bytes());
-    bmp.extend_from_slice(&2835u32.to_le_bytes());
-    bmp.extend_from_slice(&0u32.to_le_bytes());
-    bmp.extend_from_slice(&0u32.to_le_bytes());
-
-    // 0x00 pixel data = solid black
-    bmp.resize(file_size as usize, 0);
-
-    let _ = fs::write(path, bmp);
+pub fn get_state_file() -> PathBuf {
+    get_config_dir().join("original-wallpaper")
 }
 
-pub fn load_or_create_config() -> Config {
+pub fn ensure_config() -> Result<PathBuf> {
     let config_dir = get_config_dir();
     let config_file = get_config_file();
     let default_folder = config_dir.join("wallpapers").join("default");
-
+    fs::create_dir_all(&default_folder)
+        .with_context(|| format!("could not create {}", default_folder.display()))?;
     if !config_file.exists() {
-        let _ = fs::create_dir_all(&default_folder);
-
-        let black_image_path = default_folder.join("black.bmp");
-        generate_black_image(&black_image_path);
-
-        let default_ini = format!(
-            "[general]\nactive_profile = default\nrestore_on_exit = true\n\n[profile.default]\nfolder = {}\ninterval = 300\norder = random\nmute_video = true\n",
-            default_folder.to_string_lossy()
-        );
-        let _ = fs::write(&config_file, default_ini);
+        fs::write(&config_file, default_config(&default_folder))
+            .with_context(|| format!("could not write {}", config_file.display()))?;
     }
+    Ok(config_file)
+}
 
-    let ini = Ini::load_from_file(&config_file).unwrap_or_else(|_| Ini::new());
+fn default_config(folder: &Path) -> String {
+    format!("# wallctl configuration\n# order can be random or alphabetical; interval is in seconds.\n\n[general]\nactive_profile = default\nrestore_on_exit = true\n\n[profile.default]\nfolder = {}\ninterval = {DEFAULT_INTERVAL_SECS}\norder = random\nmute_video = true\n", folder.to_string_lossy())
+}
 
+pub fn load_config() -> Result<Config> {
+    let config_file = ensure_config()?;
+    let ini = Ini::load_from_file(&config_file)
+        .with_context(|| format!("could not parse {}", config_file.display()))?;
     let active_profile = ini
         .get_from(Some("general"), "active_profile")
         .unwrap_or("default")
-        .to_string();
-
+        .trim()
+        .to_owned();
     let restore_on_exit = ini
         .get_from(Some("general"), "restore_on_exit")
         .unwrap_or("true")
         .parse::<bool>()
-        .unwrap_or(true);
-
+        .context("general.restore_on_exit must be true or false")?;
     let mut profiles = HashMap::new();
-
-    for (section, prop) in &ini {
-        if let Some(sec_name) = section {
-            if let Some(profile_name) = sec_name.strip_prefix("profile.") {
-                let folder_str = prop.get("folder").unwrap_or("");
-                let expanded_folder = shellexpand::tilde(folder_str).to_string();
-
-                let profile = Profile {
-                    name: profile_name.to_string(),
-                    folder: PathBuf::from(expanded_folder),
-                    interval: prop.get("interval").and_then(|v| v.parse().ok()).unwrap_or(300),
-                    order: prop.get("order").unwrap_or("random").to_string(),
-                    mute_video: prop.get("mute_video").and_then(|v| v.parse().ok()).unwrap_or(true),
-                };
-                profiles.insert(profile_name.to_string(), profile);
-            }
+    for (section, properties) in &ini {
+        let Some(profile_name) = section.and_then(|name| name.strip_prefix("profile.")) else {
+            continue;
+        };
+        if profile_name.is_empty() {
+            bail!("profile section names must use [profile.<name>]");
         }
+        let folder = properties
+            .get("folder")
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| format!("profile '{profile_name}' requires a folder"))?;
+        let interval = properties
+            .get("interval")
+            .unwrap_or("300")
+            .parse::<u64>()
+            .with_context(|| format!("profile '{profile_name}' has an invalid interval"))?;
+        if interval == 0 {
+            bail!("profile '{profile_name}' interval must be at least one second");
+        }
+        let order =
+            PlaylistOrder::parse(properties.get("order").unwrap_or("random"), profile_name)?;
+        let mute_video = properties
+            .get("mute_video")
+            .unwrap_or("true")
+            .parse::<bool>()
+            .with_context(|| format!("profile '{profile_name}' has an invalid mute_video value"))?;
+        profiles.insert(
+            profile_name.to_owned(),
+            Profile {
+                folder: PathBuf::from(shellexpand::tilde(folder).into_owned()),
+                interval,
+                order,
+                mute_video,
+            },
+        );
     }
-
-    Config {
+    if profiles.is_empty() {
+        bail!("no profiles found in {}", config_file.display());
+    }
+    if !profiles.contains_key(&active_profile) {
+        bail!(
+            "active profile '{active_profile}' does not exist in {}",
+            config_file.display()
+        );
+    }
+    Ok(Config {
         active_profile,
         restore_on_exit,
         profiles,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlaylistOrder;
+    #[test]
+    fn parses_known_playlist_orders() {
+        assert_eq!(
+            PlaylistOrder::parse("random", "test").unwrap(),
+            PlaylistOrder::Random
+        );
+        assert_eq!(
+            PlaylistOrder::parse("alphabetical", "test").unwrap(),
+            PlaylistOrder::Alphabetical
+        );
+        assert!(PlaylistOrder::parse("shuffle", "test").is_err());
     }
 }

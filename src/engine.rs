@@ -1,68 +1,59 @@
-use crate::config::get_config_dir;
+use crate::config::get_state_file;
+use anyhow::{bail, Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 pub struct WallpaperEngine {
-    pub original_wallpaper: Option<String>,
-    pub video_process: Option<Child>,
+    video_process: Option<Child>,
 }
 
 impl WallpaperEngine {
     pub fn new() -> Self {
-        if cfg!(target_os = "macos") {
-            if let Some(store_plist) = Self::get_macos_store_plist() {
-                let backup_plist = get_config_dir().join("original_Index.plist");
-                if !backup_plist.exists() {
-                    let _ = fs::copy(&store_plist, &backup_plist);
-                }
-            }
-        }
-
-        let original = Self::fetch_current_wallpaper();
         Self {
-            original_wallpaper: original,
             video_process: None,
         }
     }
 
-    fn get_macos_store_plist() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| {
-            h.join("Library")
-                .join("Application Support")
-                .join("com.apple.wallpaper")
-                .join("Store")
-                .join("Index.plist")
-        }).filter(|p| p.exists())
+    pub fn save_original_wallpaper(&self) -> Result<()> {
+        let state_file = get_state_file();
+        if state_file.exists() {
+            return Ok(());
+        }
+        if let Some(path) = self.current_wallpaper()? {
+            fs::write(&state_file, path)
+                .with_context(|| format!("could not save {}", state_file.display()))?;
+        }
+        Ok(())
     }
 
-    fn fetch_current_wallpaper() -> Option<String> {
+    fn current_wallpaper(&self) -> Result<Option<String>> {
         if cfg!(target_os = "macos") {
-            let script = r#"ObjC.import('AppKit'); var u = $.NSWorkspace.sharedWorkspace.desktopImageURLForScreen($.NSScreen.mainScreen); u ? u.path.js : ''"#;
-            if let Ok(output) = Command::new("osascript").args(["-l", "JavaScript", "-e", script]).output() {
-                let res = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !res.is_empty() && res != "undefined" && res != "null" && !res.contains("DefaultDesktop.heic") {
-                    return Some(res);
-                }
+            let script = "ObjC.import('AppKit'); const url = $.NSWorkspace.sharedWorkspace.desktopImageURLForScreen($.NSScreen.mainScreen); if (url) console.log(ObjC.unwrap(url.path));";
+            let output = Command::new("osascript")
+                .args(["-l", "JavaScript", "-e", script])
+                .output()
+                .context("could not ask macOS for the current wallpaper")?;
+            if !output.status.success() {
+                bail!("macOS did not return the current wallpaper");
             }
-
-            let script_finder = r#"tell app "Finder" to get posix path of (get desktop picture as alias)"#;
-            if let Ok(output) = Command::new("osascript").args(["-e", script_finder]).output() {
-                let res = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !res.is_empty() && !res.contains("missing value") && !res.contains("DefaultDesktop.heic") {
-                    return Some(res);
-                }
-            }
-
-            None
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            Ok((!path.is_empty()).then_some(path))
         } else {
             let output = Command::new("gsettings")
                 .args(["get", "org.cinnamon.desktop.background", "picture-uri"])
                 .output()
-                .ok()?;
-            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let clean = raw.replace('\'', "").replace("file://", "");
-            if clean.is_empty() { None } else { Some(clean) }
+                .context("gsettings is required to read the current wallpaper")?;
+            if !output.status.success() {
+                bail!("gsettings could not read the current wallpaper");
+            }
+            let path = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .trim_matches('\'')
+                .strip_prefix("file://")
+                .unwrap_or("")
+                .to_owned();
+            Ok((!path.is_empty()).then_some(path))
         }
     }
 
@@ -73,93 +64,85 @@ impl WallpaperEngine {
         }
     }
 
-    pub fn set_static(&mut self, path: &Path) {
+    pub fn set_static(&mut self, path: &Path) -> Result<()> {
         self.stop_video();
-        let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let path_str = abs_path.to_string_lossy();
-
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("wallpaper does not exist: {}", path.display()))?;
         if cfg!(target_os = "macos") {
-            let script = format!(
-                r#"ObjC.import('AppKit'); var u = $.NSURL.fileURLWithPath('{}'); var s = $.NSScreen.screens; for(var i=0; i<s.count; i++) {{ $.NSWorkspace.sharedWorkspace.setDesktopImageURLForScreenOptionsError(u, s.objectAtIndex(i), $(), null); }}"#,
-                path_str
-            );
-            let _ = Command::new("osascript").args(["-l", "JavaScript", "-e", &script]).status();
+            let script = "ObjC.import('AppKit'); function run(argv) { const url = $.NSURL.fileURLWithPath(argv[0]); const screens = $.NSScreen.screens; for (let i = 0; i < screens.count; i++) { $.NSWorkspace.sharedWorkspace.setDesktopImageURLForScreenOptionsError(url, screens.objectAtIndex(i), $(), null); } }";
+            let status = Command::new("osascript")
+                .args([
+                    "-l",
+                    "JavaScript",
+                    "-e",
+                    script,
+                    path.to_string_lossy().as_ref(),
+                ])
+                .status()
+                .context("could not run osascript")?;
+            if !status.success() {
+                bail!("macOS rejected the wallpaper path");
+            }
         } else {
-            let uri = format!("file://{}", path_str);
-            let _ = Command::new("gsettings")
-                .args(["set", "org.cinnamon.desktop.background", "picture-uri", &uri])
-                .status();
+            let uri = format!("file://{}", path.display());
+            let status = Command::new("gsettings")
+                .args([
+                    "set",
+                    "org.cinnamon.desktop.background",
+                    "picture-uri",
+                    &uri,
+                ])
+                .status()
+                .context("gsettings is required to set wallpapers on this platform")?;
+            if !status.success() {
+                bail!("gsettings could not set the wallpaper");
+            }
         }
+        Ok(())
     }
 
-    pub fn set_video_or_gif(&mut self, path: &Path, mute: bool) {
+    pub fn set_video(&mut self, path: &Path, mute: bool) -> Result<()> {
         self.stop_video();
-        let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let path_str = abs_path.to_string_lossy();
-        let mute_arg = if mute { "--mute=yes" } else { "--mute=no" };
-
         if cfg!(target_os = "macos") {
-            let child = Command::new("mpv")
-                .args([
-                    "--wid=0",
-                    "--loop=inf",
-                    "--player-operation-mode=cplayer",
-                    "--no-osc",
-                    "--no-osd-bar",
-                    mute_arg,
-                    &path_str,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-
-            self.video_process = child.ok();
-        } else {
-            let audio_flag = if mute { "--no-audio" } else { "--audio" };
-            let child = Command::new("xwinwrap")
-                .args([
-                    "-ov",
-                    "-fs",
-                    "--",
-                    "mpv",
-                    "-wid",
-                    "WID",
-                    "--loop=inf",
-                    "--no-osc",
-                    "--no-osd-bar",
-                    audio_flag,
-                    &path_str,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-
-            self.video_process = child.ok();
+            bail!("video wallpapers are not supported on macOS; use an image or GIF instead");
         }
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("wallpaper does not exist: {}", path.display()))?;
+        let audio_flag = if mute { "--no-audio" } else { "--audio" };
+        let child = Command::new("xwinwrap")
+            .args([
+                "-ov",
+                "-fs",
+                "--",
+                "mpv",
+                "-wid",
+                "WID",
+                "--loop=inf",
+                "--no-osc",
+                "--no-osd-bar",
+                audio_flag,
+                path.to_string_lossy().as_ref(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("video wallpapers require xwinwrap and mpv")?;
+        self.video_process = Some(child);
+        Ok(())
     }
 
-    pub fn restore_original(&mut self) {
+    pub fn restore_original(&mut self) -> Result<()> {
         self.stop_video();
-        let orig_wallpaper = self.original_wallpaper.clone();
-
-        if cfg!(target_os = "macos") {
-            let backup_plist = get_config_dir().join("original_Index.plist");
-            if let Some(store_plist) = Self::get_macos_store_plist() {
-                if backup_plist.exists() {
-                    let _ = fs::copy(&backup_plist, &store_plist);
-                    let _ = fs::remove_file(&backup_plist);
-                    let _ = Command::new("killall").arg("WallpaperAgent").status();
-                    return;
-                }
-            }
-
-            if let Some(orig) = &orig_wallpaper {
-                self.set_static(Path::new(orig));
-            }
-        } else {
-            if let Some(orig) = &orig_wallpaper {
-                self.set_static(Path::new(orig));
-            }
+        let state_file = get_state_file();
+        if !state_file.exists() {
+            return Ok(());
         }
+        let path = fs::read_to_string(&state_file)
+            .with_context(|| format!("could not read {}", state_file.display()))?;
+        self.set_static(Path::new(path.trim()))?;
+        fs::remove_file(state_file).context("could not remove wallpaper restore state")?;
+        Ok(())
     }
 }

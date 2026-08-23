@@ -4,142 +4,192 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release (for example, v0.2.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Validate release
+    runs-on: macos-14
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - id: release
+        name: Validate tag and package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          test "${tag#v}" = "$version"
+          printf 'tag=%s\nversion=%s\n' "$tag" "$version" >> "$GITHUB_OUTPUT"
+      - name: Run quality gates
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo clippy --all-targets -- -D warnings
+
   build:
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.name }}
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - name: macOS Intel
+            runner: macos-13
             target: x86_64-apple-darwin
-            arch: x86_64
-          - runner: macos-14
+            artifact: macos-x86_64
+          - name: macOS Apple Silicon
+            runner: macos-14
             target: aarch64-apple-darwin
-            arch: aarch64
-
+            artifact: macos-aarch64
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Build release binary
-        run: cargo build --locked --release --target "${{ matrix.target }}"
-
-      - name: Package archive and checksum
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and package
         env:
+          VERSION: ${{ needs.prepare.outputs.version }}
           TARGET: ${{ matrix.target }}
-          ARCH: ${{ matrix.arch }}
+          ARTIFACT: ${{ matrix.artifact }}
+        shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          package="wallctl-${version}-${ARCH}"
-          mkdir -p dist
-          tar -C "target/${TARGET}/release" -czf "dist/${package}.tar.gz" wallctl
-          shasum -a 256 "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
-
-      - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
+          package="wallctl-${VERSION}-${ARTIFACT}"
+          cargo build --locked --release --target "$TARGET"
+          mkdir -p "dist/$package"
+          install -m 755 "target/$TARGET/release/wallctl" "dist/$package/wallctl"
+          cp README.md LICENSE "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          shasum -a 256 "dist/$package.tar.gz" > "dist/$package.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
         with:
-          name: wallctl-${{ matrix.arch }}
+          name: wallctl-${{ matrix.artifact }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 7
 
-  release:
-    name: Create GitHub Release
-    needs: build
+  publish:
+    name: Publish GitHub release
+    needs: [prepare, build]
     runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.release.outputs.url }}
     steps:
-      - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          pattern: wallctl-*
+          pattern: wallctl-macos-*
           merge-multiple: true
           path: dist
-
-      - name: Publish GitHub Release
+      - id: release
+        name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.sha256 \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "wallctl ${GITHUB_REF_NAME#v}" \
-            --generate-notes
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "wallctl $VERSION" --generate-notes
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+          printf 'url=%s\n' "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_OUTPUT"
 
   homebrew:
-    name: Update Homebrew Tap
-    needs: release
+    name: Open Homebrew tap PR
+    needs: [prepare, publish]
     runs-on: ubuntu-latest
     if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
     steps:
-      - name: Check out Homebrew tap
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: homebrew-tap
-
-      - name: Download release checksums
+          path: tap
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wallctl-macos-*
+          merge-multiple: true
+          path: dist
+      - name: Generate formula
         env:
-          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p checksums
-          gh release download "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --pattern '*.sha256' \
-            --dir checksums
-
-      - name: Write formula
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          intel_sha="$(awk '{print $1}' checksums/wallctl-${version}-x86_64.tar.gz.sha256)"
-          arm_sha="$(awk '{print $1}' checksums/wallctl-${version}-aarch64.tar.gz.sha256)"
-          formula_dir="homebrew-tap/Formula"
-          mkdir -p "${formula_dir}"
-          cat > "${formula_dir}/wallctl.rb" <<EOF
+          intel_sha="$(awk '{print $1}' "dist/wallctl-${VERSION}-macos-x86_64.tar.gz.sha256")"
+          arm_sha="$(awk '{print $1}' "dist/wallctl-${VERSION}-macos-aarch64.tar.gz.sha256")"
+          mkdir -p tap/Formula
+          cat > tap/Formula/wallctl.rb <<EOF
           class Wallctl < Formula
-            desc "Cross-platform dynamic wallpaper manager"
+            desc "A lightweight wallpaper rotation daemon"
             homepage "https://github.com/${GITHUB_REPOSITORY}"
-            version "${version}"
+            version "${VERSION}"
             depends_on :macos
 
             on_arm do
-              url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/wallctl-${version}-aarch64.tar.gz"
+              url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/wallctl-${VERSION}-macos-aarch64.tar.gz"
               sha256 "${arm_sha}"
             end
 
             on_intel do
-              url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/wallctl-${version}-x86_64.tar.gz"
+              url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/wallctl-${VERSION}-macos-x86_64.tar.gz"
               sha256 "${intel_sha}"
             end
 
             def install
-              bin.install "wallctl"
+              bin.install Dir["wallctl-*/wallctl"]
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/wallctl --version")
             end
           end
           EOF
+      - name: Create pull request in the tap
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          branch: automation/wallctl-${{ needs.prepare.outputs.tag }}
+          delete-branch: true
+          commit-message: "wallctl ${{ needs.prepare.outputs.tag }}"
+          title: "wallctl ${{ needs.prepare.outputs.tag }}"
+          body: |
+            Updates wallctl to ${{ needs.prepare.outputs.tag }}.
 
-      - name: Commit formula
-        working-directory: homebrew-tap
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/wallctl.rb
-          git diff --cached --quiet || git commit -m "wallctl ${GITHUB_REF_NAME#v}"
-          git push
+            Release: ${{ needs.publish.outputs.upload_url }}
+            Source: ${{ github.repository }}@${{ github.sha }}
+          add-paths: Formula/wallctl.rb

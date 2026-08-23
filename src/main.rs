@@ -3,11 +3,17 @@ mod daemon;
 mod engine;
 mod ipc;
 
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "wallctl", about = "Cross-platform dynamic wallpaper manager")]
+#[command(
+    name = "wallctl",
+    version,
+    about = "A lightweight wallpaper rotation daemon"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -15,96 +21,92 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the wallpaper background daemon
+    /// Start the wallpaper daemon.
     Start,
-    /// Stop the daemon and restore original wallpaper
+    /// Stop the daemon and restore the wallpaper from before it started.
     Stop,
-    /// Pause switching
+    /// Pause automatic switching.
     Pause,
-    /// Resume switching
+    /// Resume automatic switching.
     Resume,
-    /// Skip to next wallpaper
+    /// Switch to the next wallpaper.
     Next,
-    /// Go to previous wallpaper
+    /// Switch to the previous wallpaper.
     Prev,
-    /// Switch active profile
+    /// Switch to a configured profile.
     Switch { profile: String },
-    /// Print status of current profile & wallpaper
+    /// Reload config.ini without restarting the daemon.
+    Reload,
+    /// Print daemon state.
     Status,
+    /// Print the configuration file path, creating the default config if needed.
+    Config,
     #[command(hide = true)]
     Daemon,
 }
 
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("wallctl: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
-
-    let _ = config::load_or_create_config();
-
     match cli.command {
+        Commands::Config => println!("{}", config::ensure_config()?.display()),
         Commands::Start => {
+            config::load_config()?;
             if ipc::is_daemon_running() {
-                println!("Daemon is already running.");
-                return;
+                println!("Wallpaper daemon is already running.");
+                return Ok(());
             }
-
             ipc::cleanup_stale_files();
-
-            let current_exe = std::env::current_exe().expect("Failed to get current binary path");
-            let _ = Command::new(current_exe)
+            let current_exe =
+                std::env::current_exe().context("could not find wallctl executable")?;
+            let mut child = Command::new(current_exe)
                 .arg("daemon")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("Failed to start daemon in background");
-
-            println!("Wallpaper daemon started in background.");
+                .context("could not start wallpaper daemon")?;
+            for _ in 0..20 {
+                if ipc::is_daemon_running() {
+                    println!("Wallpaper daemon started in the background.");
+                    return Ok(());
+                }
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            anyhow::bail!("wallpaper daemon exited before it became ready; run `wallctl daemon` to inspect the error")
         }
         Commands::Stop => {
             if ipc::is_daemon_running() {
-                match ipc::send_command("STOP") {
-                    Ok(res) => println!("{}", res),
-                    Err(_) => {
-                        ipc::force_kill_daemon();
-                        let mut engine = engine::WallpaperEngine::new();
-                        engine.restore_original();
-                        println!("Daemon stopped and wallpaper restored.");
-                    }
-                }
+                println!("{}", ipc::send_command("STOP")?);
             } else {
-                ipc::cleanup_stale_files();
                 let mut engine = engine::WallpaperEngine::new();
-                engine.restore_original();
-                println!("Daemon was not running. Wallpaper restored.");
+                engine.restore_original()?;
+                ipc::cleanup_stale_files();
+                println!("Daemon was not running; restored wallpaper state if available.");
             }
         }
-        Commands::Pause => match ipc::send_command("PAUSE") {
-            Ok(res) => println!("{}", res),
-            Err(e) => eprintln!("{}", e),
-        },
-        Commands::Resume => match ipc::send_command("RESUME") {
-            Ok(res) => println!("{}", res),
-            Err(e) => eprintln!("{}", e),
-        },
-        Commands::Next => match ipc::send_command("NEXT") {
-            Ok(res) => println!("{}", res),
-            Err(e) => eprintln!("{}", e),
-        },
-        Commands::Prev => match ipc::send_command("PREV") {
-            Ok(res) => println!("{}", res),
-            Err(e) => eprintln!("{}", e),
-        },
-        Commands::Switch { profile } => match ipc::send_command(&format!("SWITCH {}", profile)) {
-            Ok(res) => println!("{}", res),
-            Err(e) => eprintln!("{}", e),
-        },
-        Commands::Status => match ipc::send_command("STATUS") {
-            Ok(res) => println!("{}", res),
-            Err(e) => eprintln!("{}", e),
-        },
-        Commands::Daemon => {
-            let mut daemon = daemon::Daemon::new();
-            daemon.run();
-        }
+        Commands::Pause => send("PAUSE")?,
+        Commands::Resume => send("RESUME")?,
+        Commands::Next => send("NEXT")?,
+        Commands::Prev => send("PREV")?,
+        Commands::Reload => send("RELOAD")?,
+        Commands::Status => send("STATUS")?,
+        Commands::Switch { profile } => send(&format!("SWITCH {profile}"))?,
+        Commands::Daemon => daemon::Daemon::new()?.run()?,
     }
+    Ok(())
+}
+
+fn send(command: &str) -> Result<()> {
+    println!("{}", ipc::send_command(command)?);
+    Ok(())
 }
