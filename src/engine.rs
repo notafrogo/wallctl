@@ -17,6 +17,7 @@ impl WallpaperEngine {
                     let _ = fs::copy(&store_plist, &backup_plist);
                 }
             }
+        }
 
         let original = Self::fetch_current_wallpaper();
         Self {
