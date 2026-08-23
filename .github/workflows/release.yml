@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            arch: x86_64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            arch: aarch64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package archive and checksum
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package="wallctl-${version}-${ARCH}"
+          mkdir -p "dist/${package}"
+          cp "target/${TARGET}/release/wallctl" "dist/${package}/wallctl"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          shasum -a 256 "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallctl-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wallctl-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.sha256 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "wallctl ${GITHUB_REF_NAME#v}" \
+            --generate-notes
+
+  homebrew:
+    name: Update Homebrew Tap
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
+    steps:
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p checksums
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.sha256' \
+            --dir checksums
+
+      - name: Write formula
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          intel_sha="$(awk '{print $1}' checksums/wallctl-${version}-x86_64.tar.gz.sha256)"
+          arm_sha="$(awk '{print $1}' checksums/wallctl-${version}-aarch64.tar.gz.sha256)"
+          formula_dir="homebrew-tap/Formula"
+          mkdir -p "${formula_dir}"
+          cat > "${formula_dir}/wallctl.rb" <<EOF
+          class Wallctl < Formula
+            desc "Cross-platform dynamic wallpaper manager"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${version}"
+            depends_on :macos
+
+            on_arm do
+              url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/wallctl-${version}-aarch64.tar.gz"
+              sha256 "${arm_sha}"
+            end
+
+            on_intel do
+              url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/wallctl-${version}-x86_64.tar.gz"
+              sha256 "${intel_sha}"
+            end
+
+            def install
+              bin.install "wallctl"
+            end
+          end
+          EOF
+
+      - name: Commit formula
+        working-directory: homebrew-tap
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/wallctl.rb
+          git diff --cached --quiet || git commit -m "wallctl ${GITHUB_REF_NAME#v}"
+          git push
