@@ -1,0 +1,3 @@
+- test and complete for mint
+- fix everything because its terrible rn
+- make it remove the old wallpapers from the wallpapers settings menu on mac
