@@ -4,14 +4,35 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_INTERVAL_SECS: u64 = 300;
+pub const DEFAULT_INTERVAL_SECS: f64 = 300.0;
 
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub folder: PathBuf,
-    pub interval: u64,
+    pub interval: f64,
     pub order: PlaylistOrder,
     pub mute_video: bool,
+    pub image_scale: ImageScale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageScale {
+    Fit,
+    FitVertical,
+    FitHorizontal,
+    Original,
+}
+
+impl ImageScale {
+    fn parse(value: &str, profile: &str) -> Result<Self> {
+        match value {
+            "fit" => Ok(Self::Fit),
+            "fit_vertical" => Ok(Self::FitVertical),
+            "fit_horizontal" => Ok(Self::FitHorizontal),
+            "original" => Ok(Self::Original),
+            other => bail!("profile '{profile}' has invalid image_scale '{other}'; use fit, fit_vertical, fit_horizontal, or original"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +87,7 @@ pub fn ensure_config() -> Result<PathBuf> {
 }
 
 fn default_config(folder: &Path) -> String {
-    format!("# wallctl configuration\n# order can be random or alphabetical; interval is in seconds.\n\n[general]\nactive_profile = default\nrestore_on_exit = true\n\n[profile.default]\nfolder = {}\ninterval = {DEFAULT_INTERVAL_SECS}\norder = random\nmute_video = true\n", folder.to_string_lossy())
+    format!("# wallctl configuration\n# order can be random or alphabetical; interval is in seconds.\n# image_scale can be fit, fit_vertical, fit_horizontal, or original.\n\n[general]\nactive_profile = default\nrestore_on_exit = true\n\n[profile.default]\nfolder = {}\ninterval = {DEFAULT_INTERVAL_SECS}\norder = alphabetical\nmute_video = true\nimage_scale = fit\n", folder.to_string_lossy())
 }
 
 pub fn load_config() -> Result<Config> {
@@ -98,18 +119,22 @@ pub fn load_config() -> Result<Config> {
         let interval = properties
             .get("interval")
             .unwrap_or("300")
-            .parse::<u64>()
+            .parse::<f64>()
             .with_context(|| format!("profile '{profile_name}' has an invalid interval"))?;
-        if interval == 0 {
-            bail!("profile '{profile_name}' interval must be at least one second");
+        if !interval.is_finite() || interval <= 0.0 {
+            bail!("profile '{profile_name}' interval must be a finite number greater than zero");
         }
-        let order =
-            PlaylistOrder::parse(properties.get("order").unwrap_or("random"), profile_name)?;
+        let order = PlaylistOrder::parse(
+            properties.get("order").unwrap_or("alphabetical"),
+            profile_name,
+        )?;
         let mute_video = properties
             .get("mute_video")
             .unwrap_or("true")
             .parse::<bool>()
             .with_context(|| format!("profile '{profile_name}' has an invalid mute_video value"))?;
+        let image_scale =
+            ImageScale::parse(properties.get("image_scale").unwrap_or("fit"), profile_name)?;
         profiles.insert(
             profile_name.to_owned(),
             Profile {
@@ -117,6 +142,7 @@ pub fn load_config() -> Result<Config> {
                 interval,
                 order,
                 mute_video,
+                image_scale,
             },
         );
     }

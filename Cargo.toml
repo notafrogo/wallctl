@@ -2,10 +2,10 @@
 name = "wallctl"
 version = "0.2.0"
 edition = "2021"
-description = "A lightweight wallpaper rotation daemon for macOS and Cinnamon"
+description = "A lightweight wallpaper rotation daemon for macOS and Linux Mint"
 license = "MIT"
 repository = "https://github.com/notafrogo/wallctl"
-keywords = ["wallpaper", "cli", "macos", "cinnamon"]
+keywords = ["wallpaper", "cli", "macos", "linux", "cinnamon"]
 categories = ["command-line-utilities"]
 
 [dependencies]
